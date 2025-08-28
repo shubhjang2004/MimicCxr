@@ -3,9 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM,AutoTokenizer
-tokenizer = AutoTokenizer.from_pretrained("microsoft/BioGPT")
-#biogpt = AutoModelForCausalLM.from_pretrained("microsoft/BioGPT")
-tokens=torch.tensor(tokenizer.encode("hello shubham how is "),dtype=torch.long).unsqueeze(0)
+
 
 """
 BioGptForCausalLM(
@@ -183,6 +181,7 @@ class BioGpTLearnedPositionalEmbeddig(nn.Module):
 
 args=Modelargs()
 biomodel=BioGptForCausalLM(args)
+
 
 
 
