@@ -49,6 +49,7 @@ class BioGptForCausalLM(nn.Module):
         self.output_projection=nn.Linear(args.dim,args.vocab_size,bias=False)
 
         self.output_projection.weight = self.biogpt.embed_tokens.embed.weight
+        self.apply(self.init_weights)
  
     def forward(self,x,y=None):
         x=self.biogpt(x)
@@ -61,8 +62,19 @@ class BioGptForCausalLM(nn.Module):
         else:
             return logits  
     
-    def get_params(self):
-        return sum(p.numel() for p in self.parameters())
+    def get_params(self,non_embedding=True):
+      n_params = sum(p.numel() for p in self.parameters())
+      if non_embedding :
+         n_params  -= self.transformer.wte.weight.numel()
+      return n_params
+
+    def init_weights(self,Module):
+      if isinstance(Module,nn.Linear):
+         torch.nn.init.normal(Module.weight,mean=0.0,std=0.02)
+         if Module.bias is not None:
+             torch.nn.init.zeros_(Module.bias)
+      elif isinstance(Module,nn.Embedding):
+          torch.nn.init.normal_(Module.weight,mean=0.0,std=0.2)
     
 
 
@@ -172,7 +184,6 @@ class BioGpTLearnedPositionalEmbeddig(nn.Module):
 args=Modelargs()
 biomodel=BioGptForCausalLM(args)
 
-print(biomodel.get_params())
-print(biomodel(tokens))
+
 
 
