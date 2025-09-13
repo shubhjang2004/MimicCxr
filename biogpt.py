@@ -38,43 +38,6 @@ class Modelargs:
     vocab_size:int=42384
     n_heads:int=16
     n_layers:int=24
-    
-
-class BioGptForCausalLM(nn.Module):
-    def __init__(self,args:Modelargs):
-        super().__init__()
-        self.biogpt=BioGptModel(args)
-        self.output_projection=nn.Linear(args.dim,args.vocab_size,bias=False)
-
-        self.output_projection.weight = self.biogpt.embed_tokens.embed.weight
-        self.apply(self.init_weights)
- 
-    def forward(self,x,y=None):
-        x=self.biogpt(x)
-        logits=self.output_projection(x)
-        if y is not None:
-            loss=nn.CrossEntropyLoss(logits.view(-1,logits.size(-1)),y.view(-1),ignore_index=-100,reduction="mean")
-
-            return logits,loss
-
-        else:
-            return logits  
-    
-    def get_params(self,non_embedding=True):
-      n_params = sum(p.numel() for p in self.parameters())
-      if non_embedding :
-         n_params  -= self.transformer.wte.weight.numel()
-      return n_params
-
-    def init_weights(self,Module):
-      if isinstance(Module,nn.Linear):
-         torch.nn.init.normal(Module.weight,mean=0.0,std=0.02)
-         if Module.bias is not None:
-             torch.nn.init.zeros_(Module.bias)
-      elif isinstance(Module,nn.Embedding):
-          torch.nn.init.normal_(Module.weight,mean=0.0,std=0.2)
-    
-
 
 
 
@@ -179,10 +142,92 @@ class BioGpTLearnedPositionalEmbeddig(nn.Module):
         return self.embed_positions(x)  
 
 
-args=Modelargs()
-biomodel=BioGptForCausalLM(args)
+
+
+#-------------final wrapper model---------------------------  
+
+class BioGptForCausalLM(nn.Module):
+    def __init__(self,args:Modelargs):
+        super().__init__()
+        self.biogpt=BioGptModel(args)
+        self.output_projection=nn.Linear(args.dim,args.vocab_size,bias=False)
+
+        self.output_projection.weight = self.biogpt.embed_tokens.embed.weight
+        self.apply(self.init_weights)
+ 
+    def forward(self,x,y=None):
+        x=self.biogpt(x)
+        logits=self.output_projection(x)
+        if y is not None:
+            loss=nn.CrossEntropyLoss(logits.view(-1,logits.size(-1)),y.view(-1),ignore_index=-100,reduction="mean")
+
+            return logits,loss
+
+        else:
+            return logits  
+    
+    def get_params(self,non_embedding=True):
+      n_params = sum(p.numel() for p in self.parameters())
+      if non_embedding :
+         n_params  -= self.transformer.wte.weight.numel()
+      return n_params
+
+    def init_weights(self,Module):
+      if isinstance(Module,nn.Linear):
+         torch.nn.init.normal(Module.weight,mean=0.0,std=0.02)
+         if Module.bias is not None:
+             torch.nn.init.zeros_(Module.bias)
+      elif isinstance(Module,nn.Embedding):
+          torch.nn.init.normal_(Module.weight,mean=0.0,std=0.2)
+
+
+    @classmethod
+    def load_hfweights_pretrained(cls):
+
+
+        args=Modelargs()
+        biogpt=BioGptForCausalLM(args) 
+        sd=biogpt.state_dict()
+        sd_keys=list(sd.keys())
+        sd_keys=[k for k in sd_keys if not k.endswith(".self_attn.bias")]
+
+
+        tokenizer = AutoTokenizer.from_pretrained("microsoft/biogpt")
+        biogpt_hf = AutoModelForCausalLM.from_pretrained("microsoft/biogpt")
+
+        sd_hf=biogpt_hf.state_dict()
+        sd_hf_keys=list(sd_hf.keys())
+        sd_hf_keys=[k for k in sd_hf_keys if not k.endswith(".self_attn.bias")]
+        sd_hf_keys=[k for k in sd_hf_keys if not k.endswith(".attn.bias")]
+
+
+        
+
+        # Map wrapper embeddings to HF keys
+        assert len(sd_keys)==len(sd_hf_keys),f"shape mismatch"
+        sd["biogpt.embed_tokens.embed.weight"].copy_(sd_hf["biogpt.embed_tokens.weight"])
+        sd["biogpt.embed_positions.embed_positions.weight"].copy_(sd_hf["biogpt.embed_positions.weight"])
+        
+        for k in sd_keys:
+            if k in ["biogpt.embed_tokens.embed.weight", "biogpt.embed_positions.embed_positions.weight"]:
+                continue
+
+            else:
+                if(sd[k].shape==sd_hf[k].shape):
+                    sd[k].copy_(sd_hf[k])
+
+        biogpt.load_state_dict(sd)
+        return biogpt                   
+
+
+                    
 
 
 
+
+
+
+
+    
 
 

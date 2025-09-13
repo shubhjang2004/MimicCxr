@@ -1,253 +1,318 @@
 import os
-import pickle
 import time
 import math
-from contextlib import nullcontext
-
-import numpy as np
 import torch
+import torch
+import pickle
+
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group,destroy_process_group
+from contextlib import nullcontext
+from torch.utils.data import DataLoader,DistributedSampler
+from data import train_dataset,val_dataset
 
-from model import model,Modelargs
-from data import train_loader,val_loader
+from model import MimicCxr,MimicCxrArgs
 
-"""
-Configuration block → sets defaults.
-DDP setup → checks if we are distributed, initializes processes, adjusts gradient accumulation.
-Data loading → simple np.memmap reader with get_batch().
-Model setup → scratch / resume / pretrained.
-Optimizer + AMP scaler.
-Compile + wrap in DDP.
-Training loop →
-get lr
-eval + checkpoint every eval_interval
-forward + backward with AMP and grad accumulation
-optimizer step + log
-"""
-# -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
-# I/O
-out_dir = 'out'
-eval_interval = 2000
-log_interval = 1
-eval_iters = 200
-eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-# wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = "mimic cxr" # 'run' + str(time.time())
-# data
-dataset = 'mimic cxr'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+#------------------config------------------------------------------
+out_dir="out"
+os.makedirs(out_dir,exist_ok=True)
+
+#logging 
+wandb_log=False
+wandb_project="mimic_cxr"
+wandb_run_name="medical"
+
+per_device_batch_size=64
+gradient_accumulation_steps = 5 * 8 
+init_from="pretrained" # resume or hf_pretrained or scratch
+
+#DDP settings
+backend="nccl"
+device="cuda"
+dtype="bfloat32" if torch.cuda.is_availabel() and torch.cuda.is_bf16_supported() else "float16"
 
 
-# adamw optimizer
-learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+# optimizer / schedule
+learning_rate = 6e-4
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
-# learning rate decay settings
-decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+grad_clip = 1.0
 
+decay_lr = True
+warmup_iters = 2000
+lr_decay_iters = 600000
+min_lr = 6e-5
 
-init_from = 'pretrained' # 'scratch' or 'resume' or 'pretrained'
-# DDP settings
-backend="nccl"
-#system
-device="cuda" # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype="bfolat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "fp16"
-compile=True
+compile_model=True
 
-ddp=int(os.environ.get("RANK",-1))!= -1
+#--------------------------------DDP init--------------------
 
+ddp=int(os.environ.get("RANK",-1)!=-1)
 if ddp:
     init_process_group(backend=backend)
-    ddp_rank=int(os.environ("RANK"))
-    ddp_local_rank=int(os.environ("LOCAL_RANK"))
-    ddp_world_size=int(os.environ("WORLD_SIZE"))
-    device=f"cuda:{ddp_local_rank}"
+    ddp_rank=int(os.environ["RANK"])
+    ddp_local_rank=int(os.environ["LOCAL_RANK"])
+    ddp_world_size=int(os.environ["WORLD_SIZE"])
 
-    master_process=ddp_rank==0  # this process will do logging, checkpointing etc.
-    
-    seed_offset=ddp_rank
-    assert gradient_accumaltion_steps%ddp_world_size==0
-    gradient_accumation_steps//=ddp_world_size
+    master_process=ddp_rank==0
+    device=f"cuda:{ddp_local_rank}"
+    seed_offset=ddp_local_rank
+
+    assert gradient_accumulation_steps%ddp_world_size==0
+    gradient_accumulation_steps//=ddp_world_size
 
 else:
-    # if not ddp, we are running on a single gpu, and one process
     master_process=True
-    seed_offset=0
     ddp_world_size=1
-
-tokens_per_iter=gradient_accumation_steps*ddp_world_size*batch_size*seqlen
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
+    seed_offset=0
 
 
-if master_process:
-    os.makedirs(out_dir,exist_ok=True)
-
-torch.manual_seed(1337+seed_offset)
-torch.backends.cuda.matmul.allow_tf32=True #allow matmul in fp32
-torch.backends.cudann.allow_tf=True  # allow tf32 on cudnn
-
-device_type="cuda" if "cuda" in device else "cpu" # for later use in torch.autocast
-# note: float16 data type will automatically use a GradScaler
-
-ptdtype={"float32":torch.float32,"bfloat16":torch.bfloat16,"float16":torch.float16}[dtype]
-
-ctx=nullcontext() if device_type== "cpu" else torch.amp.autocast(device_type=device_type,ptdtype=ptdtype)
+# ----------------- Seeds & backend flags -----------------
+torch.cuda.manual_seed(1472+seed_offset)
+torch.backends.cuda.matmul.allow_tf32=True
+torch.backends.cudann.allow_tf32=True
 
 
+device_type="cuda" if "cuda" in device else "cpu"
+ptdtype={"float32":torch.float32,"bfloat32":torch.bfloat32,"float16":torch.float16}[dtype]
 
-model.to(device)
-# initialize a GradScaler. If enabled=False scaler is a no-op
-scaler=torch.cuda.amp.GradScaler(enabled=(dtype=="float16"))
-# optimizer
+
+# -------------------------------Defining model ----------------------------------
+
+# attempt to derive vocab_size from the dataset
+metapath=os.path.join("data_dir","meta.pkl")
+meta_vocab_size=None
+
+if os.path.exists(metapath):
+    with open(metapath,"rb") as f:
+        meta=pickle.load(f)
+
+    meta_vocab_size=meta["vocab_size"]
+
+    print(f"vocab_size derived from meta")   
+
+# model init
+"""
+if init_from=="scratch":
+    #init a new model from scratch
+    print(f"starting a new model from scratch")
+    if meta_vocab_size is None:
+        MimicCxrArgs["vocab_size"]=40245
+
+    MimicCxrArgs['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    model=MimicCxr(MimicCxrArgs)
+"""
+if init_from=="resume":
+    print(f"Resuming training from {out_dir}")
+    ckpt_path=os.path.join(out_dir,"ckpt.pt")
+    checkpoint=torch.load(ckpt_path,map_location=device)
+    checkpoint_model_args=checkpoint["model_args"]
+    # force these MimicCxr attributes to be equal otherwise we can't even resume training
+    for k,v in MimicCxrArgs.items():
+        MimicCxrArgs[k]=checkpoint_model_args[k]
+
+    model=MimicCxr(MimicCxrArgs)
+    state_dict=checkpoint["model"]
+    model.load_state_dict(state_dict)  
+
+elif init_from=="hf_pretrained":
+    print("training from pretrained models")
+    print("no need to load the weights just pass the arguments")
+
+    model=MimicCxr(MimicCxrArgs) 
+
+
+model=model.to(device)
+
+ctx=nullcontext() if device_type=="cpu" else torch.autocast(device_type=device_type,ptdtype=ptdtype)
+scaler=torch.cuda.amp.GradScaler(enabled=(dtype=="float16"))     
+
+# ----------------compiling the model -----------------
 if compile:
-    print("compiling the model ... takes a few minutes")
+    print("compiling model ...may take few minutes")
     unoptimized_model=model
     model=torch.compile(model)
 
-# wrap model into DDP container
-if ddp:
-    model=DDP(model,device_ids=[ddp_local_rank])
-
-@torch.no_grad()
-
-def estimate_loss():
-    out={}
-    model.eval()
-
-
-# learning rate decay scheduler (cosine with warmup)
+#-----------LR schedule-------------------------------------------------
 def get_lr(it):
-        # 1) linear warmup for warmup_iters steps
-    if it < warmup_iters:
-        return learning_rate * (it + 1) / (warmup_iters + 1)
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_decay_iters:
+    if not decay_lr:
+        return learning_rate
+    
+    if it>lr_decay_iters:
         return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
+    
+    if it<warmup_iters:
+        return (learning_rate*((it+1)/(warmup_iters+1)))
+    
+    else:
+        decay_ratio=(it-warmup_iters)/(lr_decay_iters-warmup_iters)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return min_lr +coeff* (learning_rate - min_lr)
 
 
 
-
-
-#logging 
-if wandb_log and master_process:
-    import wandb
-    wandb.init(project=wandb_project,name=wandb_run_name,config=config)
-
-
-# training loop
-for X, Y  in train_loader:# fetch the very first batch
-    t0 = time.time()
-    local_iter_num = 0 # number of iterations in the lifetime of this process
-    raw_model = model.module if ddp else model # unwrap DDP container if needed
-
-
-
-    # determine and set the learning rate for this iteration
-    lr=get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-
-
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
-        estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-
-        if wandb_log:
-            wandb.log({
-                "iter":iter_num,
-                "train_loss":losses["train"],
-                "val_loss":losses["val"],
-                "lr":lr,
-                "mfu":running_mfu*100, #convert to percentage
-            })
-
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:  
-                checkpoint={
-                    "model": raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-
-                }
-
-                torch.save(checkpoint,os.path.join(put,dir,"ckpt.pt"))   
-
-
- 
-    if iter_num==0 and eval_only:
-        break
-
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-
-    for micro_step in range(gradient_accumation_steps):
-        if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-
-            model.require_backward_grad_sync=(micro_step=gradient_accumalation_steps-1)
-
-        with ctx:
-            logits,loss=model(X,Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+# ----------------- Data --------------------------------------------------
         
-        # backward pass, with gradient scaling if training in fp16    
-        scaler.scale(loss).backward()
+if ddp:
+    train_sampler=DistributedSampler(train_dataset,num_replicas=ddp_world_size,shuffle=True)
+    val_sampler=DistributedSampler(val_dataset,num_replicas=ddp_world_size,)
 
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
+else:
+    train_sampler=None
+    val_sampler=None
 
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
+train_loader=DataLoader(
+    train_dataset,
+    batch_size=per_device_batch_size,
+    sampler=train_sampler,
+    shuffle=(train_sampler is None),
+    num_workers=4,
+    pin_memory=True,
+    drop_last=True,
+)    
 
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-    iter_num += 1
-    local_iter_num += 1
+val_loader=DataLoader(
+    val_dataset,
+    batch_size=per_device_batch_size,
+    sampler=val_sampler,
+    shuffle=False,
+    num_workers=4
+    pin_memory=True,
+    drop_last=True,
+)
+    
 
-    # termination conditions
-    if iter_num > max_iters:
-        break
+#-------------------define how long to train here 5 epochs(sweeps) over train_loader-----------
+epochs=5
+steps_per_epoch=len(train_loader)
+max_iters=epochs*steps_per_epoch
+eval_iters=max(1,len(val_loader))
+
+log_interval=max(1,steps_per_epoch//100)
+save_interval=max(1,steps_per_epoch//5)
+
+#--------------custom function for eval over val_loader----------------------
+@torch.no_grad()
+def evaluate(eval_iters=eval_iters):
+    model.eval()
+    total = 0.0
+    n = 0
+    val_iter = iter(val_loader)
+    for _ in range(eval_iters):
+        batch = next(val_iter, None)
+        if batch is None:
+            val_iter = iter(val_loader)
+            batch = next(val_iter)
+        X, Y = batch
+        X = X.to(device, non_blocking=True)
+        Y = Y.to(device, non_blocking=True)
+        with ctx:
+            _, loss = model(X, Y)
+        total += loss.item()
+        n += 1
+    model.train()
+    return total / max(1, n)
+
+
+# ----------------- Training loop ------------------------------------
+raw_model = model.module if ddp else model # unwrap DDP container if needed
+iter_num=0
+for epoch in range(epochs):
+    # important for DistributedSampler shuffling
+    if ddp and isinstance(train_sampler,DistributedSampler):
+        train_sampler.set_epoch(epoch)
+
+    train_iter=iter(train_loader)
+
+    while True:
+        if iter_num>(epoch+1)*steps_per_epoch:
+            break
+
+        # set LR
+        lr_now = get_lr(iter_num)
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr_now  
+
+        t0 =time.time()
+        # gradient accumulation
+        optimizer.zero_grad(set_to_none=True)
+
+        for micro_step in range(gradient_accumulation_steps):
+            batch=next(train_iter,None)
+            
+            if batch is None:
+                # restart loader if exhausted (shouldn't happen inside epoch with drop_last=True)
+                train_iter=iter(train_loader)
+                batch = next(train_iter)
+
+            X,Y=batch
+            X=X.to(device,non_blocking=True)
+            Y=Y.to(device,non_blocking=True)
+
+             # avoid gradient sync on non-final micro steps in DDP
+            maybe_no_sync = model.no_sync if (ddp and micro_step < gradient_accumulation_steps - 1) else nullcontext
+            with maybe_no_sync():
+                with ctx:
+                    logits, loss = model(X, Y)
+                    loss = loss / gradient_accumulation_steps
+                scaler.scale(loss).backward()        
+
+            # clip, step, update scaler
+        if grad_clip>0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(raw_model.parameters(), grad_clip)
+        scaler.step(optimizer)
+        scaler.update()    
+
+        t1=time.time()
+        if master_process and (iter_num%log_interval==0):
+            # quick on-the-fly train loss (last microbatch scaled back)
+            train_loss_display = loss.item() * gradient_accumulation_steps
+            print(f"iter {iter_num} | epoch {epoch+1}/{epochs} | lr {lr_now:.3e} | loss {train_loss_display:.4f} | {1000*(t1-t0):.0f} ms")
+            if wandb_log:
+                import wandb
+                wandb.log({"train/loss": train_loss_display, "lr": lr_now, "iter": iter_num, "epoch": epoch})
+
+
+         # evaluate + save at epoch boundary (or any interval you like)
+         # evaluate + save at epoch boundary (or any interval you like)
+        end_of_epoch = ((iter_num + 1) % steps_per_epoch == 0)
+        if end_of_epoch and master_process:
+            val_loss = evaluate(eval_iters=eval_iters)
+            print(f"[eval] epoch {epoch+1}: val/loss {val_loss:.4f}")
+            if wandb_log:
+                wandb.log({"val/loss": val_loss, "epoch": epoch})
+
+            # save checkpoint once per epoch
+            ckpt = {
+                "model": raw_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "model_args": MimicCxrArgs,
+                "iter_num": iter_num,
+                "epoch": epoch,
+            }
+            torch.save(ckpt, os.path.join(out_dir, f"ckpt_epoch{epoch+1}.pt"))
+            # also keep a rolling "latest"
+            torch.save(ckpt, os.path.join(out_dir, "ckpt.pt"))
+
+        iter_num += 1
+
+
+# ----------------- Cleanup --------------------------------
+if ddp:
+    destroy_process_group()
+
+
+
+
+    
+
+
+
+
+
+
 
 
